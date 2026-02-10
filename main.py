@@ -5,6 +5,11 @@
 # - award_stars is HARD-LOCKED to exactly 10 + cooldown (prevents spam)
 # - equip-item events => Muggy reacts + broadcasts muggy-visual-update
 #        (Frontend detects tag + generates image via OpenAI)
+#
+# IMPORTANT DEPLOY NOTES (Railway):
+# - This file prints whether env keys exist (NOT the keys).
+# - If replies don't work on Railway, check logs for:
+#   OPENAI_API_KEY present? / GEMINI_API_KEY present? / DEEPGRAM_API_KEY present?
 # ============================================================
 
 import os
@@ -32,7 +37,15 @@ from livekit.agents import (
     ModelSettings,
 )
 from livekit.agents.llm import function_tool
-from livekit.plugins import deepgram, azure, silero
+
+# Plugins (keep imports resilient across environments)
+from livekit.plugins import deepgram, silero
+
+try:
+    from livekit.plugins import azure  # LiveKit Azure TTS plugin
+except Exception as e:
+    azure = None  # type: ignore
+    logging.getLogger("muggy-agent").warning("LiveKit azure plugin import failed: %s", e)
 
 # Azure Speech SDK (for visemes only)
 import azure.cognitiveservices.speech as speechsdk  # type: ignore
@@ -41,7 +54,9 @@ import xml.sax.saxutils as saxutils
 # ============================================================
 # ENV + LOGGING
 # ============================================================
+# Load local env (works locally; on Railway you set variables in the service)
 load_dotenv(dotenv_path=".env.local")
+load_dotenv()  # also load default .env if present
 
 log = logging.getLogger("muggy-agent")
 logging.basicConfig(level=logging.INFO)
@@ -53,8 +68,22 @@ AZURE_MUG_VOICE = os.getenv("AZURE_MUG_VOICE") or "en-US-EmmaNeural"
 AZURE_ALEX_VOICE = os.getenv("AZURE_ALEX_VOICE") or "en-US-JaneNeural"
 AZURE_JUDGE_VOICE = os.getenv("AZURE_JUDGE_VOICE") or "en-US-JennyNeural"
 
+# LLM selection (prefers OpenAI if key exists; else Gemini if key exists; else keeps your existing string)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
+
+# Log presence (NOT values)
+log.warning("OPENAI_API_KEY present? %s | length=%s", bool(OPENAI_API_KEY), len(OPENAI_API_KEY))
+log.warning("GEMINI_API_KEY present? %s | length=%s", bool(GEMINI_API_KEY), len(GEMINI_API_KEY))
+log.warning("DEEPGRAM_API_KEY present? %s | length=%s", bool(DEEPGRAM_API_KEY), len(DEEPGRAM_API_KEY))
+log.warning("AZURE_SPEECH_KEY present? %s | length=%s", bool(AZURE_SPEECH_KEY), len(AZURE_SPEECH_KEY or ""))
+
 if not AZURE_SPEECH_KEY or not AZURE_SPEECH_REGION:
     log.warning("Missing AZURE_SPEECH_KEY/AZURE_SPEECH_REGION. Visemes will fail.")
+
+if azure is None:
+    log.warning("Azure TTS plugin not available. TTS may fail unless you switch to another TTS provider.")
 
 # ============================================================
 # TEXT HELPERS
@@ -185,9 +214,13 @@ def start_azure_visemes_thread(
 ):
     def _worker():
         try:
+            if not AZURE_SPEECH_KEY or not AZURE_SPEECH_REGION:
+                return
+
             cfg = speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, region=AZURE_SPEECH_REGION)
             cfg.speech_synthesis_voice_name = voice
             synth = speechsdk.SpeechSynthesizer(speech_config=cfg, audio_config=None)
+
             seq = 0
             fired_first = False
 
@@ -297,6 +330,8 @@ class LearningData:
 
 class OpponentAlexAgent(VisemeAgent):
     def __init__(self, chat_ctx=None):
+        if azure is None:
+            raise RuntimeError("Azure TTS plugin not available; cannot create OpponentAlexAgent.")
         super().__init__(
             azure_voice_name=AZURE_ALEX_VOICE,
             instructions="You are Alex, a friendly helper. Give encouragement and one playful hint to the child.",
@@ -310,6 +345,8 @@ class OpponentAlexAgent(VisemeAgent):
 
 class JudgeDianeAgent(VisemeAgent):
     def __init__(self, chat_ctx=None):
+        if azure is None:
+            raise RuntimeError("Azure TTS plugin not available; cannot create JudgeDianeAgent.")
         super().__init__(
             azure_voice_name=AZURE_JUDGE_VOICE,
             instructions="You are Judge Diane. Provide encouragement and helpful tips. End with [[FEEDBACK_COMPLETE]].",
@@ -343,11 +380,13 @@ class MsMuggyAgent(VisemeAgent):
         "  [[IMG: a kid-friendly picture of a BLUE bird on a branch]]\n"
         "- Keep the IMG description short, concrete, kid-friendly, and related to the question.\n"
         "- Do NOT include more than ONE IMG tag per message.\n\n"
-        "- Always request images in kawaii anime sticker style (cute, bright, thick outline)."
+        "- Always request images in kawaii anime sticker style (cute, bright, thick outline). "
         "Style: short sentences, warm tone, gentle excitement."
     )
 
     def __init__(self, chat_ctx=None):
+        if azure is None:
+            raise RuntimeError("Azure TTS plugin not available; cannot create MsMuggyAgent.")
         super().__init__(
             azure_voice_name=AZURE_MUG_VOICE,
             instructions=self.INSTRUCTIONS,
@@ -381,7 +420,7 @@ class MsMuggyAgent(VisemeAgent):
     @function_tool
     async def award_stars(self, context: RunContext[LearningData], points: int):
         """Call ONLY when the child correctly answers."""
-        pts = 10
+        pts = 10  # HARD-LOCKED
 
         now = time.time()
         if (now - float(context.userdata._last_award_at)) < 3.5:
@@ -422,13 +461,56 @@ def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
 
 
+def _select_llm_value() -> Any:
+    """
+    LiveKit agents can accept either:
+    - a provider string (like "google/gemini-2.0-flash")
+    - or an LLM instance (depending on installed plugins)
+    We'll keep your original default, but prefer OpenAI/Gemini if keys exist.
+    """
+    forced = os.getenv("LLM", "").strip()
+    if forced:
+        return forced
+
+    if OPENAI_API_KEY:
+        # Prefer OpenAI if available
+        # Requires: livekit-plugins-openai installed in your backend
+        try:
+            from livekit.plugins import openai as lk_openai  # type: ignore
+
+            model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+            log.warning("Using OpenAI LLM: %s", model)
+            return lk_openai.LLM(api_key=OPENAI_API_KEY, model=model)
+        except Exception as e:
+            log.warning("OpenAI plugin not available, falling back. Reason: %s", e)
+
+    if GEMINI_API_KEY:
+        # Your prior string approach
+        gem_model = os.getenv("GEMINI_MODEL", "google/gemini-2.0-flash")
+        log.warning("Using Gemini LLM string: %s", gem_model)
+        return gem_model
+
+    # Fallback: your original default
+    log.warning("No OpenAI/Gemini key detected; using default LLM string.")
+    return "google/gemini-2.0-flash"
+
+
 async def entrypoint(ctx: JobContext):
     await ctx.connect()
 
+    # IMPORTANT: If replies fail on Railway, the most common cause is
+    # the env vars not being present in the *backend service*.
+    # The logs above will show which keys are present.
+
+    llm_value = _select_llm_value()
+
+    if azure is None:
+        raise RuntimeError("Azure TTS plugin missing. Install/enable livekit azure plugin or switch TTS provider.")
+
     session = AgentSession[LearningData](
         vad=ctx.proc.userdata["vad"],
-        llm="google/gemini-2.0-flash",
-        stt=deepgram.STT(model="nova-3"),
+        llm=llm_value,
+        stt=deepgram.STT(model=os.getenv("DEEPGRAM_MODEL", "nova-3")),
         tts=azure.TTS(voice=AZURE_MUG_VOICE),
         userdata=LearningData(),
     )
