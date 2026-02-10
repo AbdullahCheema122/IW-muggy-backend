@@ -4,7 +4,6 @@
 # - Stars-awarded events (SOURCE OF TRUTH) + awardId for UI dedupe
 # - award_stars is HARD-LOCKED to exactly 10 + cooldown (prevents spam)
 # - equip-item events => Muggy reacts + broadcasts muggy-visual-update
-# - NEW: Muggy can request an image via a tag: [[IMG: ...]]
 #        (Frontend detects tag + generates image via OpenAI)
 # ============================================================
 
