@@ -4,6 +4,12 @@
 # - Stars-awarded events (SOURCE OF TRUTH) + awardId for UI dedupe
 # - award_stars is HARD-LOCKED to exactly 10 + cooldown (prevents spam)
 # - equip-item events => Muggy reacts + broadcasts muggy-visual-update
+#        (Frontend detects tag + generates image via OpenAI)
+#
+# IMPORTANT DEPLOY NOTES (Railway):
+# - This file prints whether env keys exist (NOT the keys).
+# - If replies don't work on Railway, check logs for:
+#   OPENAI_API_KEY present? / GEMINI_API_KEY present? / DEEPGRAM_API_KEY present?
 # ============================================================
 
 import os
@@ -32,6 +38,7 @@ from livekit.agents import (
 )
 from livekit.agents.llm import function_tool
 
+# Plugins (keep imports resilient across environments)
 from livekit.plugins import deepgram, silero
 
 try:
@@ -47,8 +54,9 @@ import xml.sax.saxutils as saxutils
 # ============================================================
 # ENV + LOGGING
 # ============================================================
+# Load local env (works locally; on Railway you set variables in the service)
 load_dotenv(dotenv_path=".env.local")
-load_dotenv()
+load_dotenv()  # also load default .env if present
 
 log = logging.getLogger("muggy-agent")
 logging.basicConfig(level=logging.INFO)
@@ -60,10 +68,12 @@ AZURE_MUG_VOICE = os.getenv("AZURE_MUG_VOICE") or "en-US-EmmaNeural"
 AZURE_ALEX_VOICE = os.getenv("AZURE_ALEX_VOICE") or "en-US-JaneNeural"
 AZURE_JUDGE_VOICE = os.getenv("AZURE_JUDGE_VOICE") or "en-US-JennyNeural"
 
+# LLM selection (prefers OpenAI if key exists; else Gemini if key exists; else keeps your existing string)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 
+# Log presence (NOT values)
 log.warning("OPENAI_API_KEY present? %s | length=%s", bool(OPENAI_API_KEY), len(OPENAI_API_KEY))
 log.warning("GEMINI_API_KEY present? %s | length=%s", bool(GEMINI_API_KEY), len(GEMINI_API_KEY))
 log.warning("DEEPGRAM_API_KEY present? %s | length=%s", bool(DEEPGRAM_API_KEY), len(DEEPGRAM_API_KEY))
@@ -130,14 +140,11 @@ def normalize_arkit_frames(frames: List[List[float]]) -> List[List[float]]:
         mx = max(f) if f else 0.0
         scale = 100.0 if mx > 1.5 else 1.0
         norm = [max(0.0, min(1.0, float(v) / scale)) for v in f]
+        # soften jawOpen a bit (ARKit index 17 = jawOpen)
         if len(norm) >= 18:
-            norm[17] *= 0.75  # jawOpen soften
+            norm[17] *= 0.75
         out.append(norm)
     return out
-
-
-def strip_emojis(text: str) -> str:
-    return re.sub(r"[\U00010000-\U0010ffff]", "", text)
 
 
 # ============================================================
@@ -204,7 +211,6 @@ def start_azure_visemes_thread(
     text: str,
     voice: str,
     first_viseme_evt: Optional[threading.Event] = None,
-    viz_offset_ms: int = 0,
 ):
     def _worker():
         try:
@@ -220,7 +226,6 @@ def start_azure_visemes_thread(
 
             def on_viseme(evt):
                 nonlocal seq, fired_first
-
                 anim = safe_json_loads(getattr(evt, "animation", None))
                 if not anim:
                     return
@@ -233,9 +238,7 @@ def start_azure_visemes_thread(
                     fired_first = True
                     first_viseme_evt.set()
 
-                base_offset_ms = int(getattr(evt, "audio_offset", 0) / 10000)
-                base_offset_ms += int(viz_offset_ms)
-
+                base_offset_ms = int(getattr(evt, "audio_offset", 0) / 10000)  # 100ns -> ms
                 fps = 60
                 CHUNK = 12
 
@@ -283,8 +286,7 @@ class VisemeAgent(Agent):
         publisher.start()
         loop = asyncio.get_running_loop()
 
-        PRE_ROLL_MS = int(os.getenv("MUGGY_PRE_ROLL_MS", "260"))
-        VIZ_OFFSET_MS = int(os.getenv("MUGGY_VIZ_OFFSET_MS", "180"))
+        PRE_ROLL_MS = 90
 
         async def text_with_visemes():
             async for chunk in text:
@@ -299,7 +301,6 @@ class VisemeAgent(Agent):
                         text=clean,
                         voice=self._azure_voice_name,
                         first_viseme_evt=evt,
-                        viz_offset_ms=VIZ_OFFSET_MS,
                     )
                     await asyncio.to_thread(evt.wait, 0.35)
                     await asyncio.sleep(PRE_ROLL_MS / 1000.0)
@@ -310,13 +311,16 @@ class VisemeAgent(Agent):
 
 
 # ============================================================
-# Lesson Data + Agent
+# Lesson Data + Agents
 # ============================================================
 @dataclass
 class LearningData:
     topic: str = "Colors"
+    round_count: int = 0
     stars_earned: int = 0
-    visuals: Dict[str, str] = None
+    student_name: str = "Hero"
+    visuals: Dict[str, str] = None  # {"head":"wizard_hat", "effect":"sparkle_glow"}
+
     _last_award_at: float = 0.0
 
     def __post_init__(self):
@@ -324,36 +328,60 @@ class LearningData:
             self.visuals = {}
 
 
+class OpponentAlexAgent(VisemeAgent):
+    def __init__(self, chat_ctx=None):
+        if azure is None:
+            raise RuntimeError("Azure TTS plugin not available; cannot create OpponentAlexAgent.")
+        super().__init__(
+            azure_voice_name=AZURE_ALEX_VOICE,
+            instructions="You are Alex, a friendly helper. Give encouragement and one playful hint to the child.",
+            chat_ctx=chat_ctx,
+            tts=azure.TTS(voice=AZURE_ALEX_VOICE),
+        )
+
+    async def on_enter(self):
+        await self.session.generate_reply(instructions="Give one short, playful hint to help the child.")
+
+
+class JudgeDianeAgent(VisemeAgent):
+    def __init__(self, chat_ctx=None):
+        if azure is None:
+            raise RuntimeError("Azure TTS plugin not available; cannot create JudgeDianeAgent.")
+        super().__init__(
+            azure_voice_name=AZURE_JUDGE_VOICE,
+            instructions="You are Judge Diane. Provide encouragement and helpful tips. End with [[FEEDBACK_COMPLETE]].",
+            chat_ctx=chat_ctx,
+            tts=azure.TTS(voice=AZURE_JUDGE_VOICE),
+        )
+
+    async def on_enter(self):
+        await self.session.generate_reply()
+
+
 class MsMuggyAgent(VisemeAgent):
-    # NEW: concise but engaging structure.
-    # Always end with one question. 2–4 short lines max.
+    """
+    Ms. Muggy — Friendly teacher coffee mug
+    """
+
     INSTRUCTIONS = (
-        "You are 'Ms. Muggy', a friendly magical teacher coffee mug for kids (ages ~5–12).\n\n"
-        "OUTPUT STYLE (IMPORTANT):\n"
-        "- Keep replies concise but engaging.\n"
-        "- Use 2 to 4 SHORT lines total.\n"
-        "- Every reply MUST end with ONE clear question.\n"
-        "- Do not use emojis.\n\n"
-        "ENGAGING TEMPLATE (use this most of the time):\n"
-        "Line 1: Warm reaction (short).\n"
-        "Line 2: Tiny learning fact OR playful encouragement (short).\n"
-        "Line 3: Next question (short, specific).\n"
-        "(Optional Line 4 only if needed: quick hint.)\n\n"
-        "STARS TOOL RULE (NON-NEGOTIABLE):\n"
-        "- If the child answers correctly, you MUST call award_stars(10) immediately.\n"
-        "- Never say you awarded stars unless you actually called the tool.\n\n"
-        "FLOW:\n"
-        "1) Ask ONE question.\n"
-        "2) When user answers: judge correct/incorrect.\n"
-        "3) If correct: celebrate briefly + call award_stars(10) + ask next question.\n"
-        "4) If wrong: gentle correction + give one hint + ask same question again.\n\n"
-        "IMAGE RULE:\n"
-        "- If an image helps, say: 'Let me show you a picture!'\n"
-        "- Then output exactly one line:\n"
-        "  [[IMG: ...]]\n"
-        "- Only ONE IMG tag per message. Keep description short and kid-friendly.\n"
-        "- Request images in kawaii anime sticker style.\n\n"
-        "CURRENT LESSON: Colors (start with BLUE)."
+        "You are 'Ms. Muggy', a friendly magical teacher coffee mug. You speak to children (ages ~5–12). "
+        "Mission: discovery-based learning.\n\n"
+        "Core flow:\n"
+        "1) Introduce the topic.\n"
+        "2) Ask ONE simple question.\n"
+        "3) Wait for the child's answer.\n"
+        "4) If correct: celebrate and call award_stars(10) EXACTLY ONCE.\n"
+        "5) If wrong: give a gentle second try.\n"
+        "6) If stuck: call Alex for ONE hint.\n\n"
+        "Image rule (IMPORTANT):\n"
+        "- Sometimes show an image to help the child understand.\n"
+        "- When you want an image, say one short line: 'Let me show you a picture!'\n"
+        "- Then output EXACTLY one tag on its own line like this:\n"
+        "  [[IMG: a kid-friendly picture of a BLUE bird on a branch]]\n"
+        "- Keep the IMG description short, concrete, kid-friendly, and related to the question.\n"
+        "- Do NOT include more than ONE IMG tag per message.\n\n"
+        "- Always request images in kawaii anime sticker style (cute, bright, thick outline). "
+        "Style: short sentences, warm tone, gentle excitement."
     )
 
     def __init__(self, chat_ctx=None):
@@ -368,9 +396,9 @@ class MsMuggyAgent(VisemeAgent):
 
     async def on_enter(self):
         intro = (
-            "Hi, little hero. I’m Ms. Muggy.\n"
-            "Today we’re playing a colors game.\n"
-            "Name one thing that is BLUE."
+            "Hello, little hero! I’m Ms. Muggy. I’m so happy to learn with you today. "
+            "Let’s play a colors game. I’m thinking of something BLUE. "
+            "Can you tell me one thing that is BLUE?"
         )
         await self.session.say(intro)
 
@@ -379,11 +407,7 @@ class MsMuggyAgent(VisemeAgent):
         ud.visuals[slot] = item_id
 
         nice_name = item_id.replace("_", " ")
-        await self.session.say(
-            f"Oooh, nice choice.\n"
-            f"My {nice_name} looks awesome.\n"
-            "Want to pick another item for me?"
-        )
+        await self.session.say(f"Oh wow! That looks amazing! I love my new {nice_name}!")
 
         room = getattr(self.session, "lk_room", None)
         if room is not None:
@@ -395,6 +419,7 @@ class MsMuggyAgent(VisemeAgent):
 
     @function_tool
     async def award_stars(self, context: RunContext[LearningData], points: int):
+        """Call ONLY when the child correctly answers."""
         pts = 10  # HARD-LOCKED
 
         now = time.time()
@@ -419,7 +444,14 @@ class MsMuggyAgent(VisemeAgent):
             except Exception as e:
                 log.exception("Failed to publish stars-awarded: %s", e)
 
-        return "Great job. 10 stars added."
+        return "Wonderful! You got it right. I’m adding 10 stars to your Hall of Heroes right now!"
+
+    @function_tool
+    async def user_argument(self, context: RunContext[LearningData], point: str):
+        context.userdata.round_count += 1
+        if context.userdata.round_count >= 2:
+            return JudgeDianeAgent(chat_ctx=context.session._chat_ctx), ""
+        return OpponentAlexAgent(chat_ctx=context.session._chat_ctx), ""
 
 
 # ============================================================
@@ -429,15 +461,55 @@ def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
 
 
+def _select_llm_value() -> Any:
+    """
+    LiveKit agents can accept either:
+    - a provider string (like "google/gemini-2.0-flash")
+    - or an LLM instance (depending on installed plugins)
+    We'll keep your original default, but prefer OpenAI/Gemini if keys exist.
+    """
+    forced = os.getenv("LLM", "").strip()
+    if forced:
+        return forced
+
+    if OPENAI_API_KEY:
+        # Prefer OpenAI if available
+        # Requires: livekit-plugins-openai installed in your backend
+        try:
+            from livekit.plugins import openai as lk_openai  # type: ignore
+
+            model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+            log.warning("Using OpenAI LLM: %s", model)
+            return lk_openai.LLM(api_key=OPENAI_API_KEY, model=model)
+        except Exception as e:
+            log.warning("OpenAI plugin not available, falling back. Reason: %s", e)
+
+    if GEMINI_API_KEY:
+        # Your prior string approach
+        gem_model = os.getenv("GEMINI_MODEL", "google/gemini-2.0-flash")
+        log.warning("Using Gemini LLM string: %s", gem_model)
+        return gem_model
+
+    # Fallback: your original default
+    log.warning("No OpenAI/Gemini key detected; using default LLM string.")
+    return "google/gemini-2.0-flash"
+
+
 async def entrypoint(ctx: JobContext):
     await ctx.connect()
 
+    # IMPORTANT: If replies fail on Railway, the most common cause is
+    # the env vars not being present in the *backend service*.
+    # The logs above will show which keys are present.
+
+    llm_value = _select_llm_value()
+
     if azure is None:
-        raise RuntimeError("Azure TTS plugin missing.")
+        raise RuntimeError("Azure TTS plugin missing. Install/enable livekit azure plugin or switch TTS provider.")
 
     session = AgentSession[LearningData](
         vad=ctx.proc.userdata["vad"],
-        llm=os.getenv("GEMINI_MODEL", "google/gemini-2.0-flash"),
+        llm=llm_value,
         stt=deepgram.STT(model=os.getenv("DEEPGRAM_MODEL", "nova-3")),
         tts=azure.TTS(voice=AZURE_MUG_VOICE),
         userdata=LearningData(),
@@ -462,7 +534,10 @@ async def entrypoint(ctx: JobContext):
                 return
             if slot not in ("head", "body", "effect"):
                 return
-            await agent.react_to_equip(item_id=item_id, slot=slot)
+            try:
+                await agent.react_to_equip(item_id=item_id, slot=slot)
+            except Exception as e:
+                log.exception("react_to_equip failed: %s", e)
 
     ctx.room.on("data_received", lambda p: asyncio.create_task(handle_room_data(p)))
 
